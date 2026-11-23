@@ -1,23 +1,37 @@
-import chromadb
 import ollama
-from src.config import(
-    CHROMA_DIR,
-    COLLECTION_NAME,
-    EMBEDDING_MODEL
-)
+import json
+import math
+import sqlite3
+try:
+    from .config import(
+        CHROMA_DIR,
+        COLLECTION_NAME,
+        EMBEDDING_MODEL
+    )
+except ImportError:
+    from config import(
+        CHROMA_DIR,
+        COLLECTION_NAME,
+        EMBEDDING_MODEL
+    )
 
 class VectorStore:
 
-    # Init db and create a collection
     def __init__(self):
-        self.client = chromadb.PersistentClient(
-            path=str(CHROMA_DIR)
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        self.db_path = CHROMA_DIR / f"{COLLECTION_NAME}.sqlite3"
+        self.connection = sqlite3.connect(str(self.db_path))
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                source TEXT NOT NULL,
+                embedding TEXT NOT NULL
+            )
+            """
         )
-
-        self.collection = self.client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"}
-        )
+        self.connection.commit()
 
     # Generate embeddings for vectordb
     def generate_embedding(self, text: str) -> list[float]:
@@ -34,29 +48,28 @@ class VectorStore:
         if not documents:
             return
 
-        embeddings = []
-
         for document in documents:
             embedding = self.generate_embedding(
                 document["text"]
             )
+            self.connection.execute(
+                """
+                INSERT INTO documents (id, text, source, embedding)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    text = excluded.text,
+                    source = excluded.source,
+                    embedding = excluded.embedding
+                """,
+                (
+                    document["id"],
+                    document["text"],
+                    document["source"],
+                    json.dumps(embedding),
+                ),
+            )
 
-            embeddings.append(embedding)
-
-        self.collection.upsert(
-            ids=[doc["id"] for doc in documents],
-
-            documents=[
-                doc["text"] for doc in documents
-            ],
-
-            metadatas=[
-                {"source": doc["source"]}
-                for doc in documents
-            ],
-
-            embeddings=embeddings
-        )
+        self.connection.commit()
 
         print(f"indexed {len(documents)} chunks")
 
@@ -64,20 +77,31 @@ class VectorStore:
     def search(self, query: str, top_k: int = 4):
         query_embedding = self.generate_embedding(query)
 
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(top_k, self.collection.count()),
-            include=["documents", "metadatas", "distances"]
+        retrieved_documents = []
+        query_norm = math.sqrt(sum(value * value for value in query_embedding))
+
+        rows = self.connection.execute(
+            "SELECT text, source, embedding FROM documents"
         )
 
-        retrieved_documents = []
+        for text, source, encoded_embedding in rows:
+            embedding = json.loads(encoded_embedding)
+            document_norm = math.sqrt(sum(value * value for value in embedding))
 
-        for i, document in enumerate(results["documents"][0]):
+            if query_norm == 0 or document_norm == 0:
+                similarity = 0.0
+            else:
+                dot_product = sum(
+                    query_value * document_value
+                    for query_value, document_value in zip(query_embedding, embedding)
+                )
+                similarity = dot_product / (query_norm * document_norm)
 
             retrieved_documents.append({
-                "text": document,
-                "source": results["metadatas"][0][i]["source"],
-                "distance": results["distances"][0][i]
+                "text": text,
+                "source": source,
+                "distance": 1.0 - similarity,
             })
 
-        return retrieved_documents
+        retrieved_documents.sort(key=lambda document: document["distance"])
+        return retrieved_documents[:max(top_k, 0)]
